@@ -1,4 +1,3 @@
-
 name: Infrastructure Validation and Deployment
 
 on:
@@ -21,26 +20,22 @@ on:
           - ecs-app.yaml
           - ec2-app.yaml
           - codedeploy.yaml
-
       stack_name:
         description: Target CloudFormation stack name
         type: string
         required: true
-
       parameter_overrides:
-        description: Space-separated parameters, e.g. EnvironmentName=dev VpcId=vpc-123
+        description: 'Space-separated parameters, e.g. EnvironmentName=dev VpcId=vpc-123'
         type: string
         required: false
         default: ''
-
       confirm_deployment:
-        description: Confirm deployment preparation
+        description: Prepare a CloudFormation change set
         type: boolean
         required: true
         default: false
-
       execute_change_set:
-        description: Execute the reviewed CloudFormation change set
+        description: Execute the prepared change set (requires dev environment approval)
         type: boolean
         required: true
         default: false
@@ -56,29 +51,23 @@ jobs:
   validate:
     name: Validate CloudFormation templates
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
       - name: Install cfn-lint
-        run: python -m pip install cfn-lint
-
+        run: python -m pip install --upgrade cfn-lint
       - name: Lint all CloudFormation templates
         run: cfn-lint infra/templates/*.yaml
-
       - name: Validate selected template input
         if: github.event_name == 'workflow_dispatch'
         env:
           TEMPLATE: ${{ inputs.template }}
         run: |
           set -euo pipefail
-
           case "$TEMPLATE" in
             network.yaml|ecr.yaml|release-bucket.yaml|database.yaml|ecs-app.yaml|ec2-app.yaml|codedeploy.yaml)
               test -f "infra/templates/$TEMPLATE"
@@ -93,23 +82,20 @@ jobs:
     name: Prepare CloudFormation change set
     runs-on: ubuntu-latest
     needs: validate
-
     if: >-
       github.event_name == 'workflow_dispatch' &&
       inputs.confirm_deployment == true
-
     permissions:
       contents: read
       id-token: write
-
     outputs:
       change_set_name: ${{ steps.changeset.outputs.name }}
       stack_name: ${{ steps.changeset.outputs.stack }}
-
+      change_set_type: ${{ steps.changeset.outputs.type }}
+      no_changes: ${{ steps.changeset.outputs.no_changes }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Verify deployment context
         env:
           GH_REPOSITORY: ${{ github.repository }}
@@ -118,22 +104,18 @@ jobs:
           TEMPLATE: ${{ inputs.template }}
         run: |
           set -euo pipefail
-
           [[ "$GH_REPOSITORY" == "rajeshgoudk94-png/coditude-devops-assessment" ]] || {
-            echo "::error::Unexpected GitHub repository"
+            echo "::error::Unexpected GitHub repository."
             exit 1
           }
-
           [[ "$GH_REF" == "refs/heads/master" ]] || {
-            echo "::error::Deployments must run from master"
+            echo "::error::Deployments must run from master."
             exit 1
           }
-
-          [[ "$STACK_NAME" =~ ^coditude-(dev|staging|prod)-(network|ecr|release-bucket|database|ecs|ec2|codedeploy)$ ]] || {
-            echo "::error::Stack name must follow the approved coditude environment naming convention."
+          [[ "$STACK_NAME" =~ ^coditude-dev-(network|ecr|release-bucket|database|ecs|ec2|codedeploy)$ ]] || {
+            echo "::error::Only approved coditude-dev stack names are enabled."
             exit 1
           }
-
           case "$TEMPLATE" in
             network.yaml) EXPECTED_SUFFIX=network ;;
             ecr.yaml) EXPECTED_SUFFIX=ecr ;;
@@ -142,19 +124,12 @@ jobs:
             ecs-app.yaml) EXPECTED_SUFFIX=ecs ;;
             ec2-app.yaml) EXPECTED_SUFFIX=ec2 ;;
             codedeploy.yaml) EXPECTED_SUFFIX=codedeploy ;;
-            *) echo "::error::Unsupported template"; exit 1 ;;
+            *) echo "::error::Unsupported template."; exit 1 ;;
           esac
-
           [[ "$STACK_NAME" == *-"$EXPECTED_SUFFIX" ]] || {
             echo "::error::Stack name does not match the selected template."
             exit 1
           }
-
-          if [[ "$STACK_NAME" == coditude-prod-* || "$STACK_NAME" == coditude-staging-* ]]; then
-            echo "::error::Staging and production deployment are not enabled by this workflow yet."
-            exit 1
-          fi
-
       - name: Check required configuration
         env:
           AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
@@ -162,43 +137,26 @@ jobs:
           CFN_ROLE_ARN: ${{ vars.CLOUDFORMATION_EXECUTION_ROLE_ARN }}
         run: |
           set -euo pipefail
-
-          [[ -n "$AWS_ROLE_ARN" ]] || {
-            echo "::error::AWS_ROLE_ARN is missing"
-            exit 1
-          }
-
-          [[ -n "$AWS_REGION" ]] || {
-            echo "::error::AWS_REGION is missing"
-            exit 1
-          }
-
-          [[ -n "$CFN_ROLE_ARN" ]] || {
-            echo "::error::CLOUDFORMATION_EXECUTION_ROLE_ARN is missing"
-            exit 1
-          }
-
+          [[ -n "$AWS_ROLE_ARN" ]] || { echo "::error::AWS_ROLE_ARN is missing."; exit 1; }
+          [[ -n "$AWS_REGION" ]] || { echo "::error::AWS_REGION is missing."; exit 1; }
+          [[ -n "$CFN_ROLE_ARN" ]] || { echo "::error::CLOUDFORMATION_EXECUTION_ROLE_ARN is missing."; exit 1; }
       - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          role-session-name: GitHubActionsInfrastructure
+          role-session-name: GitHubActionsInfrastructurePrepare
           aws-region: ${{ vars.AWS_REGION }}
           mask-aws-account-id: true
-
       - name: Verify AWS identity
         run: aws sts get-caller-identity
-
       - name: Validate selected template in AWS
         env:
           TEMPLATE: ${{ inputs.template }}
         run: |
           set -euo pipefail
-
-          aws cloudformation validate-template \
-            --template-body "file://infra/templates/${TEMPLATE}"
-
-      - name: Create change set
+          aws cloudformation validate-template --template-body "file://infra/templates/${TEMPLATE}" >/dev/null
+          echo "CloudFormation template validation passed."
+      - name: Create and inspect change set
         id: changeset
         env:
           STACK_NAME: ${{ inputs.stack_name }}
@@ -208,15 +166,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          CHANGE_SET_NAME="github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-
-          if aws cloudformation describe-stacks \
-            --stack-name "$STACK_NAME" >/dev/null 2>&1; then
+          # Only an explicit matching stack result is treated as an existing stack.
+          STACK_EXISTS=$(aws cloudformation list-stacks             --query "StackSummaries[?StackName=='${STACK_NAME}' && StackStatus!='DELETE_COMPLETE'].StackName | [0]"             --output text)
+          if [[ "$STACK_EXISTS" == "$STACK_NAME" ]]; then
             CHANGE_SET_TYPE=UPDATE
           else
             CHANGE_SET_TYPE=CREATE
           fi
 
+          CHANGE_SET_NAME="github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           ARGS=(
             --stack-name "$STACK_NAME"
             --change-set-name "$CHANGE_SET_NAME"
@@ -230,10 +188,14 @@ jobs:
             read -r -a PARAM_ARRAY <<< "$PARAMS"
             ARGS+=(--parameters)
             for PARAM in "${PARAM_ARRAY[@]}"; do
+              [[ "$PARAM" == *=* ]] || {
+                echo "::error::Invalid parameter format '$PARAM'. Use Key=Value."
+                exit 1
+              }
               KEY="${PARAM%%=*}"
               VALUE="${PARAM#*=}"
-              [[ "$KEY" != "$VALUE" ]] || {
-                echo "::error::Invalid parameter format: $PARAM"
+              [[ -n "$KEY" && -n "$VALUE" ]] || {
+                echo "::error::Parameter key and value must not be empty: $PARAM"
                 exit 1
               }
               ARGS+=("ParameterKey=$KEY,ParameterValue=$VALUE")
@@ -242,35 +204,58 @@ jobs:
 
           aws cloudformation create-change-set "${ARGS[@]}"
 
-          aws cloudformation wait change-set-create-complete \
-            --stack-name "$STACK_NAME" \
-            --change-set-name "$CHANGE_SET_NAME" || true
+          if aws cloudformation wait change-set-create-complete             --stack-name "$STACK_NAME"             --change-set-name "$CHANGE_SET_NAME"; then
+            NO_CHANGES=false
+          else
+            STATUS_REASON=$(aws cloudformation describe-change-set               --stack-name "$STACK_NAME"               --change-set-name "$CHANGE_SET_NAME"               --query StatusReason --output text 2>&1 || true)
+            STATUS=$(aws cloudformation describe-change-set               --stack-name "$STACK_NAME"               --change-set-name "$CHANGE_SET_NAME"               --query Status --output text 2>&1 || true)
 
-          aws cloudformation describe-change-set \
-            --stack-name "$STACK_NAME" \
-            --change-set-name "$CHANGE_SET_NAME" \
-            --query '{Status:Status,StatusReason:StatusReason,Changes:Changes[*].ResourceChange.{Action:Action,LogicalResourceId:LogicalResourceId,ResourceType:ResourceType,Replacement:Replacement}}' \
-            --output json
+            if [[ "$STATUS" == "FAILED" ]] &&               [[ "$STATUS_REASON" == *"didn't contain changes"* || "$STATUS_REASON" == *"No updates are to be performed"* ]]; then
+              echo "No infrastructure changes are required."
+              NO_CHANGES=true
+            else
+              echo "::error::Change-set creation failed. Status: $STATUS"
+              echo "Reason: $STATUS_REASON"
+              exit 1
+            fi
+          fi
 
           echo "name=$CHANGE_SET_NAME" >> "$GITHUB_OUTPUT"
           echo "stack=$STACK_NAME" >> "$GITHUB_OUTPUT"
+          echo "type=$CHANGE_SET_TYPE" >> "$GITHUB_OUTPUT"
+          echo "no_changes=$NO_CHANGES" >> "$GITHUB_OUTPUT"
+
+          if [[ "$NO_CHANGES" == "false" ]]; then
+            aws cloudformation describe-change-set               --stack-name "$STACK_NAME"               --change-set-name "$CHANGE_SET_NAME"               --query '{StackName:StackName,ChangeSetName:ChangeSetName,Status:Status,ExecutionStatus:ExecutionStatus,Changes:Changes[*].ResourceChange.{Action:Action,LogicalResourceId:LogicalResourceId,ResourceType:ResourceType,Replacement:Replacement}}'               --output json
+          fi
+      - name: Preparation summary
+        if: always()
+        env:
+          STACK_NAME: ${{ inputs.stack_name }}
+          TEMPLATE: ${{ inputs.template }}
+        run: |
+          {
+            echo "### CloudFormation preparation"
+            echo "- Template: \`$TEMPLATE\`"
+            echo "- Stack: \`$STACK_NAME\`"
+            echo "- This job prepares a change set; it does not execute it."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   execute:
     name: Execute reviewed change set
     runs-on: ubuntu-latest
     needs: prepare
-
     if: >-
       github.event_name == 'workflow_dispatch' &&
       inputs.confirm_deployment == true &&
-      inputs.execute_change_set == true
-
+      inputs.execute_change_set == true &&
+      needs.prepare.result == 'success' &&
+      needs.prepare.outputs.no_changes == 'false'
+    # Configure required reviewers for the GitHub "dev" environment.
     environment: dev
-
     permissions:
       contents: read
       id-token: write
-
     steps:
       - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v4
@@ -278,59 +263,53 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           role-session-name: GitHubActionsInfrastructureExecute
           aws-region: ${{ vars.AWS_REGION }}
-
-      - name: Verify change set
+          mask-aws-account-id: true
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+      - name: Verify change set is still executable
         env:
           STACK_NAME: ${{ needs.prepare.outputs.stack_name }}
           CHANGE_SET_NAME: ${{ needs.prepare.outputs.change_set_name }}
         run: |
           set -euo pipefail
-
-          aws cloudformation describe-change-set \
-            --stack-name "$STACK_NAME" \
-            --change-set-name "$CHANGE_SET_NAME" \
-            --query '{Status:Status,ExecutionStatus:ExecutionStatus,Changes:Changes[*].ResourceChange.{Action:Action,LogicalResourceId:LogicalResourceId,ResourceType:ResourceType,Replacement:Replacement}}' \
-            --output json
-
-      - name: Execute change set
-        env:
-          STACK_NAME: ${{ needs.prepare.outputs.stack_name }}
-          CHANGE_SET_NAME: ${{ needs.prepare.outputs.change_set_name }}
-        run: |
-          set -euo pipefail
-
-          STATUS=$(aws cloudformation describe-change-set \
-            --stack-name "$STACK_NAME" \
-            --change-set-name "$CHANGE_SET_NAME" \
-            --query Status \
-            --output text)
-
-          EXECUTION_STATUS=$(aws cloudformation describe-change-set \
-            --stack-name "$STACK_NAME" \
-            --change-set-name "$CHANGE_SET_NAME" \
-            --query ExecutionStatus \
-            --output text)
+          STATUS=$(aws cloudformation describe-change-set             --stack-name "$STACK_NAME"             --change-set-name "$CHANGE_SET_NAME"             --query Status --output text)
+          EXECUTION_STATUS=$(aws cloudformation describe-change-set             --stack-name "$STACK_NAME"             --change-set-name "$CHANGE_SET_NAME"             --query ExecutionStatus --output text)
 
           [[ "$STATUS" == "CREATE_COMPLETE" ]] || {
             echo "::error::Change set is not ready: $STATUS"
             exit 1
           }
-
           [[ "$EXECUTION_STATUS" == "AVAILABLE" ]] || {
             echo "::error::Change set is not available: $EXECUTION_STATUS"
             exit 1
           }
 
-          aws cloudformation execute-change-set \
-            --stack-name "$STACK_NAME" \
-            --change-set-name "$CHANGE_SET_NAME"
+          aws cloudformation describe-change-set             --stack-name "$STACK_NAME"             --change-set-name "$CHANGE_SET_NAME"             --query '{StackName:StackName,ChangeSetName:ChangeSetName,Status:Status,ExecutionStatus:ExecutionStatus,Changes:Changes[*].ResourceChange.{Action:Action,LogicalResourceId:LogicalResourceId,ResourceType:ResourceType,Replacement:Replacement}}'             --output json
+      - name: Execute change set and wait for the correct stack operation
+        env:
+          STACK_NAME: ${{ needs.prepare.outputs.stack_name }}
+          CHANGE_SET_NAME: ${{ needs.prepare.outputs.change_set_name }}
+          CHANGE_SET_TYPE: ${{ needs.prepare.outputs.change_set_type }}
+        run: |
+          set -euo pipefail
+          aws cloudformation execute-change-set             --stack-name "$STACK_NAME"             --change-set-name "$CHANGE_SET_NAME"
 
-          aws cloudformation wait stack-create-complete \
-            --stack-name "$STACK_NAME" 2>/dev/null || \
-          aws cloudformation wait stack-update-complete \
-            --stack-name "$STACK_NAME"
+          if [[ "$CHANGE_SET_TYPE" == "CREATE" ]]; then
+            aws cloudformation wait stack-create-complete --stack-name "$STACK_NAME"
+          else
+            aws cloudformation wait stack-update-complete --stack-name "$STACK_NAME"
+          fi
 
-          aws cloudformation describe-stacks \
-            --stack-name "$STACK_NAME" \
-            --query 'Stacks[0].{StackName:StackName,StackStatus:StackStatus}' \
-            --output table
+          aws cloudformation describe-stacks             --stack-name "$STACK_NAME"             --query 'Stacks[0].{StackName:StackName,StackStatus:StackStatus}'             --output table
+      - name: Deployment summary
+        if: always()
+        env:
+          STACK_NAME: ${{ needs.prepare.outputs.stack_name }}
+          CHANGE_SET_NAME: ${{ needs.prepare.outputs.change_set_name }}
+        run: |
+          {
+            echo "### CloudFormation execution"
+            echo "- Stack: \`$STACK_NAME\`"
+            echo "- Change set: \`$CHANGE_SET_NAME\`"
+            echo "- Review the job result and CloudFormation stack events."
+          } >> "$GITHUB_STEP_SUMMARY"
