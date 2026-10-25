@@ -1,3 +1,4 @@
+
 name: Frontend Container Deployment
 
 on:
@@ -18,11 +19,13 @@ concurrency:
 
 jobs:
   build-test-deploy:
+    name: Build and Deploy Frontend
     runs-on: ubuntu-latest
     environment: ${{ vars.DEPLOY_ENV || 'dev' }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Validate deployment variables
         env:
@@ -33,14 +36,16 @@ jobs:
           ECS_FRONTEND_SERVICE: ${{ vars.ECS_FRONTEND_SERVICE }}
         run: |
           set -euo pipefail
+
           for name in AWS_REGION AWS_ROLE_ARN ECR_FRONTEND_REPOSITORY ECS_CLUSTER ECS_FRONTEND_SERVICE; do
-            if [ -z "${!name:-}" ]; then
-              echo "::error::Required GitHub variable '$name' is missing or unavailable."
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Required GitHub variable '$name' is missing."
               exit 1
             fi
           done
 
-      - uses: actions/setup-node@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: npm
@@ -54,37 +59,76 @@ jobs:
         working-directory: apps/frontend
         run: npm run build
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: GitHubActionsFrontendDeploy
           aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
 
       - name: Log in to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push immutable image
+        id: image
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           REPOSITORY: ${{ vars.ECR_FRONTEND_REPOSITORY }}
-          IMAGE_TAG: ${{ github.sha }}-${{ github.run_attempt }}
+          IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          docker build -t "$REGISTRY/$REPOSITORY:$IMAGE_TAG" apps/frontend
-          docker push "$REGISTRY/$REPOSITORY:$IMAGE_TAG"
 
-      - name: Update frontend ECS service only
+          IMAGE="$REGISTRY/$REPOSITORY:$IMAGE_TAG"
+
+          docker build --tag "$IMAGE" apps/frontend
+          docker push "$IMAGE"
+
+          echo "uri=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Validate frontend ECS service
         env:
           CLUSTER: ${{ vars.ECS_CLUSTER }}
           SERVICE: ${{ vars.ECS_FRONTEND_SERVICE }}
-          IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_FRONTEND_REPOSITORY }}:${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
 
+          aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0]' \
+            --output json > service.json
+
+          jq -e '.status == "ACTIVE" and .taskDefinition != null' \
+            service.json >/dev/null || {
+              echo "::error::Frontend ECS service is not active or has no task definition."
+              cat service.json
+              exit 1
+            }
+
+      - name: Register updated task definition
+        id: task-definition
+        env:
+          CLUSTER: ${{ vars.ECS_CLUSTER }}
+          SERVICE: ${{ vars.ECS_FRONTEND_SERVICE }}
+          IMAGE: ${{ steps.image.outputs.uri }}
+        run: |
+          set -euo pipefail
+
+          CURRENT_TASK_DEFINITION=$(aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0].taskDefinition' \
+            --output text)
+
           aws ecs describe-task-definition \
-            --task-definition "$SERVICE" \
-            --query taskDefinition > task-definition.json
+            --task-definition "$CURRENT_TASK_DEFINITION" \
+            --query taskDefinition \
+            > task-definition.json
 
           jq -e 'any(.containerDefinitions[]; .name == "frontend")' \
             task-definition.json >/dev/null || {
@@ -113,19 +157,59 @@ jobs:
             --query 'taskDefinition.taskDefinitionArn' \
             --output text)
 
+          echo "arn=$ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy frontend ECS service
+        env:
+          CLUSTER: ${{ vars.ECS_CLUSTER }}
+          SERVICE: ${{ vars.ECS_FRONTEND_SERVICE }}
+          TASK_DEFINITION: ${{ steps.task-definition.outputs.arn }}
+        run: |
+          set -euo pipefail
+
           aws ecs update-service \
             --cluster "$CLUSTER" \
             --service "$SERVICE" \
-            --task-definition "$ARN" \
-            --force-new-deployment
+            --task-definition "$TASK_DEFINITION"
 
           aws ecs wait services-stable \
             --cluster "$CLUSTER" \
             --services "$SERVICE"
 
-      - name: Deployment summary
-        if: success()
+      - name: Verify deployed frontend
+        env:
+          CLUSTER: ${{ vars.ECS_CLUSTER }}
+          SERVICE: ${{ vars.ECS_FRONTEND_SERVICE }}
+          EXPECTED_TASK_DEFINITION: ${{ steps.task-definition.outputs.arn }}
         run: |
-          echo "Frontend deployment completed successfully."
+          set -euo pipefail
+
+          ACTUAL_TASK_DEFINITION=$(aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0].taskDefinition' \
+            --output text)
+
+          if [[ "$ACTUAL_TASK_DEFINITION" != "$EXPECTED_TASK_DEFINITION" ]]; then
+            echo "::error::Frontend service is not using the expected task definition."
+            exit 1
+          fi
+
+          aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0].{status:status,desiredCount:desiredCount,runningCount:runningCount,taskDefinition:taskDefinition}' \
+            --output table
+
+      - name: Deployment summary
+        if: always()
+        env:
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
+          TASK_DEFINITION: ${{ steps.task-definition.outputs.arn }}
+        run: |
+          echo "Frontend deployment workflow finished."
           echo "Commit: $GITHUB_SHA"
-          echo "Image tag: ${GITHUB_SHA}-${GITHUB_RUN_ATTEMPT}"
+          echo "Image tag: ${IMAGE_TAG:-not-built}"
+          echo "Image URI: ${IMAGE_URI:-not-built}"
+          echo "Task definition: ${TASK_DEFINITION:-not-registered}"
