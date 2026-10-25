@@ -1,53 +1,123 @@
+
 name: Infrastructure Validation and Deployment
+
 on:
   pull_request:
-    paths: ['infra/**', '.github/workflows/infrastructure.yml']
+    paths:
+      - 'infra/**'
+      - '.github/workflows/infrastructure.yml'
+
   workflow_dispatch:
     inputs:
       template:
-        description: CloudFormation template file name
+        description: CloudFormation template to deploy
         type: choice
         required: true
-        options: [network.yaml, ecr.yaml, release-bucket.yaml, database.yaml, ecs-app.yaml, ec2-app.yaml, codedeploy.yaml]
+        options:
+          - network.yaml
+          - ecr.yaml
+          - release-bucket.yaml
+          - database.yaml
+          - ecs-app.yaml
+          - ec2-app.yaml
+          - codedeploy.yaml
+
       stack_name:
         description: Target CloudFormation stack name
         type: string
         required: true
+
       parameter_overrides:
-        description: Space-separated CloudFormation parameter overrides
+        description: 'Space-separated parameters, e.g. EnvironmentName=dev VpcId=vpc-123'
         type: string
         required: false
         default: ''
+
+      confirm_deployment:
+        description: Confirm that AWS infrastructure should be deployed
+        type: boolean
+        required: true
+        default: false
+
 permissions:
   contents: read
-  id-token: write
+
 jobs:
   validate:
+    name: Validate CloudFormation templates
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: {python-version: '3.12'}
-      - run: pip install cfn-lint
-      - run: cfn-lint infra/templates/*.yaml
-      - name: Validate selected template syntax in AWS
-        if: github.event_name == 'workflow_dispatch'
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install cfn-lint
+        run: pip install cfn-lint
+
+      - name: Lint all CloudFormation templates
+        run: cfn-lint infra/templates/*.yaml
+
+  deploy:
+    name: Deploy selected CloudFormation stack
+    runs-on: ubuntu-latest
+    needs: validate
+
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.confirm_deployment == true
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
-      - name: Deploy infrastructure stack (manual only)
-        if: github.event_name == 'workflow_dispatch'
+
+      - name: Validate selected template in AWS
+        env:
+          TEMPLATE: ${{ inputs.template }}
+        run: |
+          set -euo pipefail
+          aws cloudformation validate-template \
+            --template-body "file://infra/templates/${TEMPLATE}"
+
+      - name: Deploy CloudFormation stack
         env:
           STACK_NAME: ${{ inputs.stack_name }}
           TEMPLATE: ${{ inputs.template }}
           PARAMS: ${{ inputs.parameter_overrides }}
         run: |
           set -euo pipefail
-          aws cloudformation validate-template --template-body "file://infra/templates/$TEMPLATE"
-          if [ -n "$PARAMS" ]; then
-            # Manual deployment is intentionally explicit. Use protected GitHub Environments for staging/prod.
-            aws cloudformation deploy --template-file "infra/templates/$TEMPLATE" --stack-name "$STACK_NAME" --parameter-overrides $PARAMS --no-fail-on-empty-changeset
-          else
-            aws cloudformation deploy --template-file "infra/templates/$TEMPLATE" --stack-name "$STACK_NAME" --no-fail-on-empty-changeset
+
+          if [[ -z "$STACK_NAME" ]]; then
+            echo "Error: stack_name is required."
+            exit 1
           fi
+
+          PARAM_ARRAY=()
+
+          if [[ -n "$PARAMS" ]]; then
+            read -r -a PARAM_ARRAY <<< "$PARAMS"
+          fi
+
+          echo "Deploying template: $TEMPLATE"
+          echo "Target stack: $STACK_NAME"
+          echo "Review the AWS changes before proceeding."
+
+          aws cloudformation deploy \
+            --template-file "infra/templates/${TEMPLATE}" \
+            --stack-name "$STACK_NAME" \
+            --parameter-overrides "${PARAM_ARRAY[@]}" \
+            --no-fail-on-empty-changeset
