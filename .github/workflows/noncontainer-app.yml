@@ -1,0 +1,60 @@
+name: Non-containerized Application Release
+on:
+  workflow_dispatch:
+    inputs:
+      component:
+        description: Component to release
+        required: true
+        type: choice
+        options: [frontend, backend]
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  package-deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ vars.DEPLOY_ENV || 'dev' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        if: inputs.component == 'frontend'
+        with: {node-version: '20'}
+      - name: Build frontend standalone bundle
+        if: inputs.component == 'frontend'
+        working-directory: apps/frontend
+        run: |
+          set -euo pipefail
+          npm install
+          npm run build
+          mkdir -p ../../release/app/.next
+          cp -R .next/standalone/. ../../release/app/
+          cp -R .next/static ../../release/app/.next/static
+          cp -R ../../deploy/codedeploy/frontend/. ../../release/
+      - name: Package backend bundle
+        if: inputs.component == 'backend'
+        run: |
+          set -euo pipefail
+          python -m compileall apps/backend
+          mkdir -p release/app
+          cp apps/backend/main.py apps/backend/requirements.txt release/app/
+          cp -R deploy/codedeploy/backend/. release/
+      - name: Create release archive
+        run: tar -czf release.tgz -C release .
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Upload immutable artifact
+        env:
+          BUCKET: ${{ vars.RELEASE_BUCKET }}
+          COMPONENT: ${{ inputs.component }}
+        run: aws s3 cp release.tgz "s3://$BUCKET/$COMPONENT/${GITHUB_SHA}/release.tgz"
+      - name: Trigger CodeDeploy deployment
+        env:
+          BUCKET: ${{ vars.RELEASE_BUCKET }}
+          COMPONENT: ${{ inputs.component }}
+          APPLICATION: ${{ vars.CODEDEPLOY_APPLICATION }}
+          DEPLOYMENT_GROUP: ${{ inputs.component == 'frontend' && vars.CODEDEPLOY_FRONTEND_GROUP || vars.CODEDEPLOY_BACKEND_GROUP }}
+        run: |
+          set -euo pipefail
+          aws deploy create-deployment --application-name "$APPLICATION" --deployment-group-name "$DEPLOYMENT_GROUP" --s3-location bucket="$BUCKET",key="$COMPONENT/${GITHUB_SHA}/release.tgz",bundleType=tar --description "${COMPONENT} ${GITHUB_SHA}"

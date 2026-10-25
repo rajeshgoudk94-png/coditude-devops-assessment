@@ -1,0 +1,53 @@
+name: Infrastructure Validation and Deployment
+on:
+  pull_request:
+    paths: ['infra/**', '.github/workflows/infrastructure.yml']
+  workflow_dispatch:
+    inputs:
+      template:
+        description: CloudFormation template file name
+        type: choice
+        required: true
+        options: [network.yaml, ecr.yaml, release-bucket.yaml, database.yaml, ecs-app.yaml, ec2-app.yaml, codedeploy.yaml]
+      stack_name:
+        description: Target CloudFormation stack name
+        type: string
+        required: true
+      parameter_overrides:
+        description: Space-separated CloudFormation parameter overrides
+        type: string
+        required: false
+        default: ''
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: pip install cfn-lint
+      - run: cfn-lint infra/templates/*.yaml
+      - name: Validate selected template syntax in AWS
+        if: github.event_name == 'workflow_dispatch'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Deploy infrastructure stack (manual only)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          STACK_NAME: ${{ inputs.stack_name }}
+          TEMPLATE: ${{ inputs.template }}
+          PARAMS: ${{ inputs.parameter_overrides }}
+        run: |
+          set -euo pipefail
+          aws cloudformation validate-template --template-body "file://infra/templates/$TEMPLATE"
+          if [ -n "$PARAMS" ]; then
+            # Manual deployment is intentionally explicit. Use protected GitHub Environments for staging/prod.
+            aws cloudformation deploy --template-file "infra/templates/$TEMPLATE" --stack-name "$STACK_NAME" --parameter-overrides $PARAMS --no-fail-on-empty-changeset
+          else
+            aws cloudformation deploy --template-file "infra/templates/$TEMPLATE" --stack-name "$STACK_NAME" --no-fail-on-empty-changeset
+          fi

@@ -1,0 +1,52 @@
+name: Frontend Container Deployment
+on:
+  push:
+    branches: [main]
+    paths: ['apps/frontend/**', '.github/workflows/frontend-container.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: frontend-deploy-${{ vars.DEPLOY_ENV || 'dev' }}
+  cancel-in-progress: false
+jobs:
+  build-test-deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ vars.DEPLOY_ENV || 'dev' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+        working-directory: apps/frontend
+      - run: npm run build
+        working-directory: apps/frontend
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: login-ecr
+      - name: Build and push immutable image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: ${{ vars.ECR_FRONTEND_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          docker build -t "$REGISTRY/$REPOSITORY:$IMAGE_TAG" apps/frontend
+          docker push "$REGISTRY/$REPOSITORY:$IMAGE_TAG"
+      - name: Update frontend ECS service only
+        env:
+          CLUSTER: ${{ vars.ECS_CLUSTER }}
+          SERVICE: ${{ vars.ECS_FRONTEND_SERVICE }}
+          IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_FRONTEND_REPOSITORY }}:${{ github.sha }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          aws ecs describe-task-definition --task-definition "$SERVICE" --query taskDefinition > task-definition.json
+          jq --arg image "$IMAGE" '.containerDefinitions |= map(if .name == "frontend" then .image = $image else . end) | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' task-definition.json > task-definition-new.json
+          ARN=$(aws ecs register-task-definition --cli-input-json file://task-definition-new.json --query 'taskDefinition.taskDefinitionArn' --output text)
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --task-definition "$ARN" --force-new-deployment
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"

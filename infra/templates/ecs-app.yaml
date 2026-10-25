@@ -1,0 +1,132 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Containerized frontend and backend on ECS Fargate behind an ALB.
+Parameters:
+  EnvironmentName: { Type: String, AllowedValues: [dev, staging, prod] }
+  VpcId: { Type: AWS::EC2::VPC::Id }
+  PublicSubnetIds: { Type: List<AWS::EC2::Subnet::Id> }
+  PrivateSubnetIds: { Type: List<AWS::EC2::Subnet::Id> }
+  FrontendImage: { Type: String, Description: ECR image URI including tag }
+  BackendImage: { Type: String, Description: ECR image URI including tag }
+  CertificateArn: { Type: String, Default: '', Description: Optional ACM certificate ARN for HTTPS listener }
+  DBSecretArn: { Type: String, Default: '', Description: Optional RDS managed secret ARN }
+  DBHost: { Type: String, Default: '', Description: RDS endpoint hostname }
+  DBName: { Type: String, Default: appdb }
+Conditions:
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, '']]
+  HasDatabaseSecret: !Not [!Equals [!Ref DBSecretArn, '']]
+Resources:
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public web entry
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0 }
+  TaskSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App tasks only receive traffic from ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3000, ToPort: 3000, SourceSecurityGroupId: !Ref AlbSG }
+        - { IpProtocol: tcp, FromPort: 8000, ToPort: 8000, SourceSecurityGroupId: !Ref AlbSG }
+  Cluster: { Type: AWS::ECS::Cluster, Properties: { ClusterName: !Sub '${EnvironmentName}-app-cluster', ClusterSettings: [{Name: containerInsights, Value: enabled}] } }
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: { Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: sts:AssumeRole}] }
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy]
+      Policies:
+        - PolicyName: ReadDatabaseSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !If [HasDatabaseSecret, !Ref DBSecretArn, !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:unused']
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: { Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: sts:AssumeRole}] }
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties: { Scheme: internet-facing, Type: application, Subnets: !Ref PublicSubnetIds, SecurityGroups: [!Ref AlbSG] }
+  FrontendTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: { VpcId: !Ref VpcId, Port: 3000, Protocol: HTTP, TargetType: ip, HealthCheckPath: / }
+  BackendTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: { VpcId: !Ref VpcId, Port: 8000, Protocol: HTTP, TargetType: ip, HealthCheckPath: /health }
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties: { LoadBalancerArn: !Ref Alb, Port: 80, Protocol: HTTP, DefaultActions: [{Type: forward, TargetGroupArn: !Ref FrontendTG}] }
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 443
+      Protocol: HTTPS
+      Certificates: [{CertificateArn: !Ref CertificateArn}]
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref FrontendTG}]
+  HttpsApiRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: HasCertificate
+    Properties:
+      ListenerArn: !Ref HttpsListener
+      Priority: 10
+      Conditions: [{Field: path-pattern, Values: ['/api/*', '/health', '/db-health']}]
+      Actions: [{Type: forward, TargetGroupArn: !Ref BackendTG}]
+  ApiRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties: { ListenerArn: !Ref HttpListener, Priority: 10, Conditions: [{Field: path-pattern, Values: ['/api/*', '/health', '/db-health']}], Actions: [{Type: forward, TargetGroupArn: !Ref BackendTG}] }
+  FrontendTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvironmentName}-frontend'
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ContainerDefinitions: [{Name: frontend, Image: !Ref FrontendImage, Essential: true, PortMappings: [{ContainerPort: 3000, Protocol: tcp}], LogConfiguration: {LogDriver: awslogs, Options: {awslogs-group: !Ref FrontendLogGroup, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: frontend}}}]
+  BackendTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvironmentName}-backend'
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Ref BackendImage
+          Essential: true
+          PortMappings: [{ContainerPort: 8000, Protocol: tcp}]
+          Environment: [{Name: APP_ENV, Value: !Ref EnvironmentName}, {Name: DB_HOST, Value: !Ref DBHost}, {Name: DB_NAME, Value: !Ref DBName}]
+          Secrets: !If
+            - HasDatabaseSecret
+            - [{Name: DB_USER, ValueFrom: !Sub '${DBSecretArn}:username::'}, {Name: DB_PASSWORD, ValueFrom: !Sub '${DBSecretArn}:password::'}]
+            - !Ref AWS::NoValue
+          LogConfiguration: {LogDriver: awslogs, Options: {awslogs-group: !Ref BackendLogGroup, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: backend}}
+  FrontendService:
+    Type: AWS::ECS::Service
+    DependsOn: HttpListener
+    Properties: { ServiceName: !Sub '${EnvironmentName}-frontend', Cluster: !Ref Cluster, LaunchType: FARGATE, DesiredCount: 2, TaskDefinition: !Ref FrontendTask, DeploymentConfiguration: {MinimumHealthyPercent: 50, MaximumPercent: 200}, NetworkConfiguration: {AwsvpcConfiguration: {AssignPublicIp: DISABLED, Subnets: !Ref PrivateSubnetIds, SecurityGroups: [!Ref TaskSG]}}, LoadBalancers: [{ContainerName: frontend, ContainerPort: 3000, TargetGroupArn: !Ref FrontendTG}] }
+  BackendService:
+    Type: AWS::ECS::Service
+    DependsOn: HttpListener
+    Properties: { ServiceName: !Sub '${EnvironmentName}-backend', Cluster: !Ref Cluster, LaunchType: FARGATE, DesiredCount: 2, TaskDefinition: !Ref BackendTask, DeploymentConfiguration: {MinimumHealthyPercent: 50, MaximumPercent: 200}, NetworkConfiguration: {AwsvpcConfiguration: {AssignPublicIp: DISABLED, Subnets: !Ref PrivateSubnetIds, SecurityGroups: [!Ref TaskSG]}}, LoadBalancers: [{ContainerName: backend, ContainerPort: 8000, TargetGroupArn: !Ref BackendTG}] }
+  FrontendLogGroup: { Type: AWS::Logs::LogGroup, Properties: { LogGroupName: !Sub '/ecs/${EnvironmentName}/frontend', RetentionInDays: 30 } }
+  BackendLogGroup: { Type: AWS::Logs::LogGroup, Properties: { LogGroupName: !Sub '/ecs/${EnvironmentName}/backend', RetentionInDays: 30 } }
+Outputs:
+  LoadBalancerDNS: { Value: !GetAtt Alb.DNSName }
+  ECSClusterName: { Value: !Ref Cluster }
+  FrontendServiceName: { Value: !GetAtt FrontendService.Name }
+  BackendServiceName: { Value: !GetAtt BackendService.Name }
+  AppSecurityGroupId: { Value: !Ref TaskSG }

@@ -1,0 +1,58 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Private PostgreSQL RDS database with encryption and managed credentials.
+Parameters:
+  EnvironmentName: { Type: String, AllowedValues: [dev, staging, prod] }
+  VpcId: { Type: AWS::EC2::VPC::Id }
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  AppSecurityGroupId: { Type: AWS::EC2::SecurityGroup::Id }
+  DBInstanceClass: { Type: String, Default: db.t4g.small }
+  AllocatedStorage: { Type: Number, Default: 20, MinValue: 20, MaxValue: 1000 }
+  DBName: { Type: String, Default: appdb, AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*' }
+Resources:
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow PostgreSQL only from application security group
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppSecurityGroupId
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private DB subnets
+      SubnetIds: !Ref PrivateSubnetIds
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${EnvironmentName}-app-postgres'
+      Engine: postgres
+      EngineVersion: '16.4'
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref AllocatedStorage
+      MaxAllocatedStorage: 100
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: !Ref DBName
+      ManageMasterUserPassword: true
+      MasterUsername: appadmin
+      MultiAZ: !If [IsProd, true, false]
+      PubliclyAccessible: false
+      BackupRetentionPeriod: !If [IsProd, 14, 7]
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [!Ref DBSecurityGroup]
+      EnableCloudwatchLogsExports: [postgresql, upgrade]
+      Tags: [{Key: Environment, Value: !Ref EnvironmentName}]
+Conditions:
+  IsProd: !Equals [!Ref EnvironmentName, prod]
+Outputs:
+  DBEndpoint: { Value: !GetAtt Database.Endpoint.Address }
+  DBPort: { Value: !GetAtt Database.Endpoint.Port }
+  DBSecretArn: { Value: !GetAtt Database.MasterUserSecret.SecretArn }

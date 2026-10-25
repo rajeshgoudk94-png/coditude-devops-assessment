@@ -1,0 +1,58 @@
+name: Backend Container Deployment
+on:
+  push:
+    branches: [main]
+    paths: ['apps/backend/**', '.github/workflows/backend-container.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: backend-deploy-${{ vars.DEPLOY_ENV || 'dev' }}
+  cancel-in-progress: false
+jobs:
+  build-test-deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ vars.DEPLOY_ENV || 'dev' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: |
+          pip install -r apps/backend/requirements.txt pytest
+          python -m compileall apps/backend
+          pytest -q apps/backend/test_main.py
+          python - <<'PY'
+          from fastapi.testclient import TestClient
+          from apps.backend.main import app
+          client = TestClient(app)
+          assert client.get('/health').status_code == 200
+          PY
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: login-ecr
+      - name: Build and push immutable image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: ${{ vars.ECR_BACKEND_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          docker build -t "$REGISTRY/$REPOSITORY:$IMAGE_TAG" apps/backend
+          docker push "$REGISTRY/$REPOSITORY:$IMAGE_TAG"
+      - name: Update backend ECS service only
+        env:
+          CLUSTER: ${{ vars.ECS_CLUSTER }}
+          SERVICE: ${{ vars.ECS_BACKEND_SERVICE }}
+          IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_BACKEND_REPOSITORY }}:${{ github.sha }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          aws ecs describe-task-definition --task-definition "$SERVICE" --query taskDefinition > task-definition.json
+          jq --arg image "$IMAGE" '.containerDefinitions |= map(if .name == "backend" then .image = $image else . end) | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' task-definition.json > task-definition-new.json
+          ARN=$(aws ecs register-task-definition --cli-input-json file://task-definition-new.json --query 'taskDefinition.taskDefinitionArn' --output text)
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --task-definition "$ARN" --force-new-deployment
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"

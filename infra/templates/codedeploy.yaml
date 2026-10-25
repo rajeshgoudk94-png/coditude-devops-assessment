@@ -1,0 +1,53 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS CodeDeploy application and deployment groups for EC2-hosted frontend and backend.
+Parameters:
+  EnvironmentName: {Type: String, AllowedValues: [dev, staging, prod]}
+  ApplicationName: {Type: String, Default: coditude-app}
+  FrontendASGName: {Type: String, Description: Name of the frontend Auto Scaling Group}
+  BackendASGName: {Type: String, Description: Name of the backend Auto Scaling Group}
+Resources:
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codedeploy.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole]
+  Application:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub '${ApplicationName}-${EnvironmentName}'
+      ComputePlatform: Server
+  FrontendDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref Application
+      DeploymentGroupName: !Sub '${EnvironmentName}-frontend'
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      AutoScalingGroups: [!Ref FrontendASGName]
+      DeploymentConfigName: CodeDeployDefault.OneAtATime
+      DeploymentStyle: {DeploymentType: IN_PLACE, DeploymentOption: WITHOUT_TRAFFIC_CONTROL}
+      AutoRollbackConfiguration: {Enabled: true, Events: [DEPLOYMENT_FAILURE, DEPLOYMENT_STOP_ON_ALARM]}
+      EC2TagFilters:
+        - {Key: Component, Value: frontend, Type: KEY_AND_VALUE}
+        - {Key: Environment, Value: !Ref EnvironmentName, Type: KEY_AND_VALUE}
+  BackendDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref Application
+      DeploymentGroupName: !Sub '${EnvironmentName}-backend'
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      AutoScalingGroups: [!Ref BackendASGName]
+      DeploymentConfigName: CodeDeployDefault.OneAtATime
+      DeploymentStyle: {DeploymentType: IN_PLACE, DeploymentOption: WITHOUT_TRAFFIC_CONTROL}
+      AutoRollbackConfiguration: {Enabled: true, Events: [DEPLOYMENT_FAILURE, DEPLOYMENT_STOP_ON_ALARM]}
+      EC2TagFilters:
+        - {Key: Component, Value: backend, Type: KEY_AND_VALUE}
+        - {Key: Environment, Value: !Ref EnvironmentName, Type: KEY_AND_VALUE}
+Outputs:
+  CodeDeployApplicationName: {Value: !Ref Application}
+  FrontendDeploymentGroupName: {Value: !Ref FrontendDeploymentGroup}
+  BackendDeploymentGroupName: {Value: !Ref BackendDeploymentGroup}

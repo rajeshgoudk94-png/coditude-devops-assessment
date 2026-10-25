@@ -1,0 +1,26 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Encrypted, versioned private S3 bucket for non-containerized release artifacts.
+Resources:
+  ReleaseBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration: {Status: Enabled}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldReleaseVersions
+            Status: Enabled
+            NoncurrentVersionExpiration: {NoncurrentDays: 90}
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 7}
+Outputs:
+  ReleaseBucketName: {Value: !Ref ReleaseBucket}
+  ReleaseBucketArn: {Value: !GetAtt ReleaseBucket.Arn}
