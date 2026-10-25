@@ -1,3 +1,4 @@
+
 name: Infrastructure Validation and Deployment
 
 on:
@@ -56,7 +57,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install cfn-lint
-        run: pip install cfn-lint
+        run: python -m pip install cfn-lint
 
       - name: Lint all CloudFormation templates
         run: cfn-lint infra/templates/*.yaml
@@ -78,31 +79,91 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Verify GitHub OIDC context
+        env:
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_REF: ${{ github.ref }}
+          GH_EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          echo "Repository: $GH_REPOSITORY"
+          echo "Ref: $GH_REF"
+          echo "Event: $GH_EVENT"
+
+          [[ "$GH_REPOSITORY" == "rajeshgoudk94-png/coditude-devops-assessment" ]] || {
+            echo "Unexpected GitHub repository"
+            exit 1
+          }
+
+          [[ "$GH_REF" == "refs/heads/master" ]] || {
+            echo "Deployment must run from master"
+            exit 1
+          }
+
+          [[ "$GH_EVENT" == "workflow_dispatch" ]] || {
+            echo "Deployment must be manually triggered"
+            exit 1
+          }
+
       - name: Check required configuration
         env:
           AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
           AWS_REGION: ${{ vars.AWS_REGION }}
           CFN_ROLE_ARN: ${{ vars.CLOUDFORMATION_EXECUTION_ROLE_ARN }}
           STACK_NAME: ${{ inputs.stack_name }}
+          TEMPLATE: ${{ inputs.template }}
         run: |
           set -euo pipefail
 
-          [[ -n "$AWS_ROLE_ARN" ]] || { echo "AWS_ROLE_ARN variable is missing"; exit 1; }
-          [[ -n "$AWS_REGION" ]] || { echo "AWS_REGION variable is missing"; exit 1; }
-          [[ -n "$CFN_ROLE_ARN" ]] || { echo "CLOUDFORMATION_EXECUTION_ROLE_ARN variable is missing"; exit 1; }
-          [[ -n "$STACK_NAME" ]] || { echo "Stack name is required"; exit 1; }
+          [[ -n "$AWS_ROLE_ARN" ]] || {
+            echo "AWS_ROLE_ARN variable is missing"
+            exit 1
+          }
+
+          [[ -n "$AWS_REGION" ]] || {
+            echo "AWS_REGION variable is missing"
+            exit 1
+          }
+
+          [[ -n "$CFN_ROLE_ARN" ]] || {
+            echo "CLOUDFORMATION_EXECUTION_ROLE_ARN variable is missing"
+            exit 1
+          }
+
+          [[ -n "$STACK_NAME" ]] || {
+            echo "Stack name is required"
+            exit 1
+          }
+
+          case "$TEMPLATE" in
+            network.yaml|ecr.yaml|release-bucket.yaml|database.yaml|ecs-app.yaml|ec2-app.yaml|codedeploy.yaml)
+              test -f "infra/templates/$TEMPLATE"
+              ;;
+            *)
+              echo "Unsupported CloudFormation template: $TEMPLATE"
+              exit 1
+              ;;
+          esac
 
       - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: GitHubActionsInfrastructure
           aws-region: ${{ vars.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Verify AWS identity
+        run: |
+          set -euo pipefail
+          aws sts get-caller-identity
 
       - name: Validate selected template in AWS
         env:
           TEMPLATE: ${{ inputs.template }}
         run: |
           set -euo pipefail
+
           aws cloudformation validate-template \
             --template-body "file://infra/templates/${TEMPLATE}"
 
@@ -129,5 +190,8 @@ jobs:
 
           echo "Deploying template: $TEMPLATE"
           echo "Target stack: $STACK_NAME"
+          echo "Region: $AWS_REGION"
 
           aws cloudformation deploy "${DEPLOY_ARGS[@]}"
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
