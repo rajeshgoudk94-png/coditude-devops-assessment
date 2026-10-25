@@ -36,7 +36,6 @@ jobs:
           ECS_FRONTEND_SERVICE: ${{ vars.ECS_FRONTEND_SERVICE }}
         run: |
           set -euo pipefail
-
           for name in AWS_REGION AWS_ROLE_ARN ECR_FRONTEND_REPOSITORY ECS_CLUSTER ECS_FRONTEND_SERVICE; do
             if [[ -z "${!name:-}" ]]; then
               echo "::error::Required GitHub variable '$name' is missing."
@@ -81,27 +80,15 @@ jobs:
           IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
-
           IMAGE="$REGISTRY/$REPOSITORY:$IMAGE_TAG"
 
-<<<<<<< HEAD
           docker build --tag "$IMAGE" apps/frontend
-=======
-          docker build \
-            --tag "$IMAGE" \
-            apps/frontend
-
->>>>>>> 82c509f (Improve frontend container deployment workflow)
           docker push "$IMAGE"
 
           echo "uri=$IMAGE" >> "$GITHUB_OUTPUT"
           echo "tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
-<<<<<<< HEAD
       - name: Validate frontend ECS service
-=======
-      - name: Validate ECS task definition
->>>>>>> 82c509f (Improve frontend container deployment workflow)
         env:
           CLUSTER: ${{ vars.ECS_CLUSTER }}
           SERVICE: ${{ vars.ECS_FRONTEND_SERVICE }}
@@ -111,11 +98,7 @@ jobs:
           aws ecs describe-services \
             --cluster "$CLUSTER" \
             --services "$SERVICE" \
-<<<<<<< HEAD
             --query 'services[0]' \
-=======
-            --query 'services[0].{status:status,desiredCount:desiredCount,taskDefinition:taskDefinition}' \
->>>>>>> 82c509f (Improve frontend container deployment workflow)
             --output json > service.json
 
           jq -e '.status == "ACTIVE" and .taskDefinition != null' \
@@ -125,28 +108,10 @@ jobs:
               exit 1
             }
 
-<<<<<<< HEAD
-      - name: Register updated task definition
-        id: task-definition
-        env:
-          CLUSTER: ${{ vars.ECS_CLUSTER }}
-          SERVICE: ${{ vars.ECS_FRONTEND_SERVICE }}
-          IMAGE: ${{ steps.image.outputs.uri }}
-        run: |
-          set -euo pipefail
-
-          CURRENT_TASK_DEFINITION=$(aws ecs describe-services \
-            --cluster "$CLUSTER" \
-            --services "$SERVICE" \
-            --query 'services[0].taskDefinition' \
-            --output text)
+          CURRENT_TASK_DEFINITION=$(jq -r '.taskDefinition' service.json)
 
           aws ecs describe-task-definition \
-=======
-          TASK_DEFINITION=$(jq -r '.taskDefinition' service.json)
-
-          aws ecs describe-task-definition \
-            --task-definition "$TASK_DEFINITION" \
+            --task-definition "$CURRENT_TASK_DEFINITION" \
             --query taskDefinition \
             > task-definition.json
 
@@ -159,9 +124,9 @@ jobs:
       - name: Register updated task definition
         id: task-definition
         env:
-          IMAGE: ${{ steps.image.outputs.uri }}
           CLUSTER: ${{ vars.ECS_CLUSTER }}
           SERVICE: ${{ vars.ECS_FRONTEND_SERVICE }}
+          IMAGE: ${{ steps.image.outputs.uri }}
         run: |
           set -euo pipefail
 
@@ -172,7 +137,6 @@ jobs:
             --output text)
 
           aws ecs describe-task-definition \
->>>>>>> 82c509f (Improve frontend container deployment workflow)
             --task-definition "$CURRENT_TASK_DEFINITION" \
             --query taskDefinition \
             > task-definition.json
@@ -223,11 +187,7 @@ jobs:
             --cluster "$CLUSTER" \
             --services "$SERVICE"
 
-<<<<<<< HEAD
       - name: Verify deployed frontend
-=======
-      - name: Verify deployed frontend task definition
->>>>>>> 82c509f (Improve frontend container deployment workflow)
         env:
           CLUSTER: ${{ vars.ECS_CLUSTER }}
           SERVICE: ${{ vars.ECS_FRONTEND_SERVICE }}
@@ -242,11 +202,7 @@ jobs:
             --output text)
 
           if [[ "$ACTUAL_TASK_DEFINITION" != "$EXPECTED_TASK_DEFINITION" ]]; then
-<<<<<<< HEAD
             echo "::error::Frontend service is not using the expected task definition."
-=======
-            echo "::error::The frontend service is not using the expected task definition."
->>>>>>> 82c509f (Improve frontend container deployment workflow)
             exit 1
           fi
 
