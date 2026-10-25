@@ -1,7 +1,7 @@
 name: Frontend Container Deployment
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths: ['apps/frontend/**', '.github/workflows/frontend-container.yml']
   workflow_dispatch:
 permissions:
