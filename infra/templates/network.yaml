@@ -1,6 +1,7 @@
 
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Shared VPC with public/private subnets across two AZs, IGW, NAT gateways, and routing.
+
+Description: Shared VPC with public/private subnets across two AZs, IGW, optional NAT gateways, and routing.
 
 Parameters:
   EnvironmentName:
