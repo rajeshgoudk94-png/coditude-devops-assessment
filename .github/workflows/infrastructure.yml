@@ -1,4 +1,3 @@
-
 name: Infrastructure Validation and Deployment
 
 on:
@@ -79,6 +78,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Check required configuration
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          CFN_ROLE_ARN: ${{ vars.CLOUDFORMATION_EXECUTION_ROLE_ARN }}
+          STACK_NAME: ${{ inputs.stack_name }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "$AWS_ROLE_ARN" ]] || { echo "AWS_ROLE_ARN variable is missing"; exit 1; }
+          [[ -n "$AWS_REGION" ]] || { echo "AWS_REGION variable is missing"; exit 1; }
+          [[ -n "$CFN_ROLE_ARN" ]] || { echo "CLOUDFORMATION_EXECUTION_ROLE_ARN variable is missing"; exit 1; }
+          [[ -n "$STACK_NAME" ]] || { echo "Stack name is required"; exit 1; }
+
       - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -98,26 +111,23 @@ jobs:
           STACK_NAME: ${{ inputs.stack_name }}
           TEMPLATE: ${{ inputs.template }}
           PARAMS: ${{ inputs.parameter_overrides }}
+          CFN_ROLE_ARN: ${{ vars.CLOUDFORMATION_EXECUTION_ROLE_ARN }}
         run: |
           set -euo pipefail
 
-          if [[ -z "$STACK_NAME" ]]; then
-            echo "Error: stack_name is required."
-            exit 1
-          fi
-
-          PARAM_ARRAY=()
+          DEPLOY_ARGS=(
+            --template-file "infra/templates/${TEMPLATE}"
+            --stack-name "$STACK_NAME"
+            --role-arn "$CFN_ROLE_ARN"
+            --no-fail-on-empty-changeset
+          )
 
           if [[ -n "$PARAMS" ]]; then
             read -r -a PARAM_ARRAY <<< "$PARAMS"
+            DEPLOY_ARGS+=(--parameter-overrides "${PARAM_ARRAY[@]}")
           fi
 
           echo "Deploying template: $TEMPLATE"
           echo "Target stack: $STACK_NAME"
-          echo "Review the AWS changes before proceeding."
 
-          aws cloudformation deploy \
-            --template-file "infra/templates/${TEMPLATE}" \
-            --stack-name "$STACK_NAME" \
-            --parameter-overrides "${PARAM_ARRAY[@]}" \
-            --no-fail-on-empty-changeset
+          aws cloudformation deploy "${DEPLOY_ARGS[@]}"
