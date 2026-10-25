@@ -32,7 +32,7 @@ Resources:
     Properties:
       DBInstanceIdentifier: !Sub '${EnvironmentName}-app-postgres'
       Engine: postgres
-      EngineVersion: '16.4'
+      EngineVersion: '16.15'
       DBInstanceClass: !Ref DBInstanceClass
       AllocatedStorage: !Ref AllocatedStorage
       MaxAllocatedStorage: 100

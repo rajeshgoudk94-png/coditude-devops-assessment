@@ -1,4 +1,4 @@
-import os
+﻿import os
 from contextlib import closing
 
 from fastapi import FastAPI, HTTPException
@@ -27,7 +27,7 @@ def db_health():
     try:
         import psycopg
         with closing(psycopg.connect(host=host, dbname=name, user=user, password=password,
-                                     connect_timeout=3, sslmode="require")) as conn:
+                                     connect_timeout=3, sslmode=os.getenv("DB_SSLMODE", "require"))) as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
                 cur.fetchone()

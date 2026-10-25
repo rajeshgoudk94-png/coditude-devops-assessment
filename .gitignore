@@ -7,3 +7,11 @@ __pycache__/
 .venv/
 *.pyc
 *.zip
+
+# Python validation environment and test artifacts
+.venv-validation/
+.pytest_cache/
+*.py[cod]
+
+# Local validation output
+validation.log
