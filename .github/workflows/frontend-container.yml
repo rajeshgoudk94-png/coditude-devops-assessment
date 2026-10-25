@@ -1,34 +1,69 @@
 name: Frontend Container Deployment
+
 on:
   push:
     branches: [master]
-    paths: ['apps/frontend/**', '.github/workflows/frontend-container.yml']
+    paths:
+      - 'apps/frontend/**'
+      - '.github/workflows/frontend-container.yml'
   workflow_dispatch:
+
 permissions:
   contents: read
   id-token: write
+
 concurrency:
   group: frontend-deploy-${{ vars.DEPLOY_ENV || 'dev' }}
   cancel-in-progress: false
+
 jobs:
   build-test-deploy:
     runs-on: ubuntu-latest
     environment: ${{ vars.DEPLOY_ENV || 'dev' }}
+
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate deployment variables
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          ECR_FRONTEND_REPOSITORY: ${{ vars.ECR_FRONTEND_REPOSITORY }}
+          ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+          ECS_FRONTEND_SERVICE: ${{ vars.ECS_FRONTEND_SERVICE }}
+        run: |
+          set -euo pipefail
+          for name in AWS_REGION AWS_ROLE_ARN ECR_FRONTEND_REPOSITORY ECS_CLUSTER ECS_FRONTEND_SERVICE; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Required GitHub variable '$name' is missing or unavailable."
+              exit 1
+            fi
+          done
+
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - run: npm install
+          cache: npm
+          cache-dependency-path: apps/frontend/package-lock.json
+
+      - name: Install frontend dependencies
         working-directory: apps/frontend
-      - run: npm run build
+        run: npm ci
+
+      - name: Build frontend
         working-directory: apps/frontend
-      - uses: aws-actions/configure-aws-credentials@v4
+        run: npm run build
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
-      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Log in to Amazon ECR
         id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
       - name: Build and push immutable image
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -38,6 +73,7 @@ jobs:
           set -euo pipefail
           docker build -t "$REGISTRY/$REPOSITORY:$IMAGE_TAG" apps/frontend
           docker push "$REGISTRY/$REPOSITORY:$IMAGE_TAG"
+
       - name: Update frontend ECS service only
         env:
           CLUSTER: ${{ vars.ECS_CLUSTER }}
@@ -45,8 +81,51 @@ jobs:
           IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_FRONTEND_REPOSITORY }}:${{ github.sha }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          aws ecs describe-task-definition --task-definition "$SERVICE" --query taskDefinition > task-definition.json
-          jq --arg image "$IMAGE" '.containerDefinitions |= map(if .name == "frontend" then .image = $image else . end) | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' task-definition.json > task-definition-new.json
-          ARN=$(aws ecs register-task-definition --cli-input-json file://task-definition-new.json --query 'taskDefinition.taskDefinitionArn' --output text)
-          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --task-definition "$ARN" --force-new-deployment
-          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+
+          aws ecs describe-task-definition \
+            --task-definition "$SERVICE" \
+            --query taskDefinition > task-definition.json
+
+          jq -e 'any(.containerDefinitions[]; .name == "frontend")' \
+            task-definition.json >/dev/null || {
+              echo "::error::Container named frontend was not found."
+              exit 1
+            }
+
+          jq --arg image "$IMAGE" '
+            .containerDefinitions |= map(
+              if .name == "frontend" then .image = $image else . end
+            )
+            | del(
+                .taskDefinitionArn,
+                .revision,
+                .status,
+                .requiresAttributes,
+                .compatibilities,
+                .registeredAt,
+                .registeredBy,
+                .deregisteredAt
+              )
+          ' task-definition.json > task-definition-new.json
+
+          ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://task-definition-new.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          aws ecs update-service \
+            --cluster "$CLUSTER" \
+            --service "$SERVICE" \
+            --task-definition "$ARN" \
+            --force-new-deployment
+
+          aws ecs wait services-stable \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE"
+
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "Frontend deployment completed successfully."
+          echo "Commit: $GITHUB_SHA"
+          echo "Image tag: ${GITHUB_SHA}-${GITHUB_RUN_ATTEMPT}"
