@@ -1,58 +1,249 @@
+
 name: Backend Container Deployment
+
 on:
   push:
     branches: [master]
-    paths: ['apps/backend/**', '.github/workflows/backend-container.yml']
+    paths:
+      - 'apps/backend/**'
+      - '.github/workflows/backend-container.yml'
   workflow_dispatch:
+
 permissions:
   contents: read
   id-token: write
+
 concurrency:
   group: backend-deploy-${{ vars.DEPLOY_ENV || 'dev' }}
   cancel-in-progress: false
+
 jobs:
   build-test-deploy:
+    name: Test, Build and Deploy Backend
     runs-on: ubuntu-latest
     environment: ${{ vars.DEPLOY_ENV || 'dev' }}
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate deployment variables
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          ECR_BACKEND_REPOSITORY: ${{ vars.ECR_BACKEND_REPOSITORY }}
+          ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+          ECS_BACKEND_SERVICE: ${{ vars.ECS_BACKEND_SERVICE }}
+        run: |
+          set -euo pipefail
+
+          for name in AWS_REGION AWS_ROLE_ARN ECR_BACKEND_REPOSITORY ECS_CLUSTER ECS_BACKEND_SERVICE; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Required GitHub variable '$name' is missing."
+              exit 1
+            fi
+          done
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: |
-          pip install -r apps/backend/requirements.txt pytest
-          python -m compileall apps/backend
-          pytest -q apps/backend/test_main.py
+          cache: pip
+          cache-dependency-path: apps/backend/requirements.txt
+
+      - name: Install backend dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r apps/backend/requirements.txt pytest
+
+      - name: Compile backend
+        run: python -m compileall apps/backend
+
+      - name: Run backend tests
+        run: pytest -q apps/backend/test_main.py
+
+      - name: Verify backend health endpoint
+        run: |
+          set -euo pipefail
+
           python - <<'PY'
           from fastapi.testclient import TestClient
           from apps.backend.main import app
+
           client = TestClient(app)
-          assert client.get('/health').status_code == 200
+          response = client.get("/health")
+
+          assert response.status_code == 200, (
+              f"Health check failed: {response.status_code} {response.text}"
+          )
+          print("Backend health endpoint test passed.")
           PY
-      - uses: aws-actions/configure-aws-credentials@v4
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: GitHubActionsBackendDeploy
           aws-region: ${{ vars.AWS_REGION }}
-      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Log in to Amazon ECR
         id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
       - name: Build and push immutable image
+        id: image
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           REPOSITORY: ${{ vars.ECR_BACKEND_REPOSITORY }}
-          IMAGE_TAG: ${{ github.sha }}-${{ github.run_attempt }}
+          IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          docker build -t "$REGISTRY/$REPOSITORY:$IMAGE_TAG" apps/backend
-          docker push "$REGISTRY/$REPOSITORY:$IMAGE_TAG"
-      - name: Update backend ECS service only
+
+          IMAGE="$REGISTRY/$REPOSITORY:$IMAGE_TAG"
+
+          docker build --tag "$IMAGE" apps/backend
+          docker push "$IMAGE"
+
+          echo "uri=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Validate backend ECS service
         env:
           CLUSTER: ${{ vars.ECS_CLUSTER }}
           SERVICE: ${{ vars.ECS_BACKEND_SERVICE }}
-          IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_BACKEND_REPOSITORY }}:${{ github.sha }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          aws ecs describe-task-definition --task-definition "$SERVICE" --query taskDefinition > task-definition.json
-          jq --arg image "$IMAGE" '.containerDefinitions |= map(if .name == "backend" then .image = $image else . end) | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' task-definition.json > task-definition-new.json
-          ARN=$(aws ecs register-task-definition --cli-input-json file://task-definition-new.json --query 'taskDefinition.taskDefinitionArn' --output text)
-          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --task-definition "$ARN" --force-new-deployment
-          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+
+          aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0]' \
+            --output json > service.json
+
+          jq -e '.status == "ACTIVE" and .taskDefinition != null' \
+            service.json >/dev/null || {
+              echo "::error::Backend ECS service is not active or has no task definition."
+              cat service.json
+              exit 1
+            }
+
+          CURRENT_TASK_DEFINITION=$(jq -r '.taskDefinition' service.json)
+
+          aws ecs describe-task-definition \
+            --task-definition "$CURRENT_TASK_DEFINITION" \
+            --query taskDefinition \
+            > task-definition.json
+
+          jq -e 'any(.containerDefinitions[]; .name == "backend")' \
+            task-definition.json >/dev/null || {
+              echo "::error::Container named backend was not found."
+              exit 1
+            }
+
+      - name: Register updated task definition
+        id: task-definition
+        env:
+          CLUSTER: ${{ vars.ECS_CLUSTER }}
+          SERVICE: ${{ vars.ECS_BACKEND_SERVICE }}
+          IMAGE: ${{ steps.image.outputs.uri }}
+        run: |
+          set -euo pipefail
+
+          CURRENT_TASK_DEFINITION=$(aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0].taskDefinition' \
+            --output text)
+
+          aws ecs describe-task-definition \
+            --task-definition "$CURRENT_TASK_DEFINITION" \
+            --query taskDefinition \
+            > task-definition.json
+
+          jq -e 'any(.containerDefinitions[]; .name == "backend")' \
+            task-definition.json >/dev/null || {
+              echo "::error::Container named backend was not found."
+              exit 1
+            }
+
+          jq --arg image "$IMAGE" '
+            .containerDefinitions |= map(
+              if .name == "backend" then .image = $image else . end
+            )
+            | del(
+                .taskDefinitionArn,
+                .revision,
+                .status,
+                .requiresAttributes,
+                .compatibilities,
+                .registeredAt,
+                .registeredBy,
+                .deregisteredAt
+              )
+          ' task-definition.json > task-definition-new.json
+
+          ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://task-definition-new.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "arn=$ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy backend ECS service
+        env:
+          CLUSTER: ${{ vars.ECS_CLUSTER }}
+          SERVICE: ${{ vars.ECS_BACKEND_SERVICE }}
+          TASK_DEFINITION: ${{ steps.task-definition.outputs.arn }}
+        run: |
+          set -euo pipefail
+
+          aws ecs update-service \
+            --cluster "$CLUSTER" \
+            --service "$SERVICE" \
+            --task-definition "$TASK_DEFINITION"
+
+          aws ecs wait services-stable \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE"
+
+      - name: Verify deployed backend
+        env:
+          CLUSTER: ${{ vars.ECS_CLUSTER }}
+          SERVICE: ${{ vars.ECS_BACKEND_SERVICE }}
+          EXPECTED_TASK_DEFINITION: ${{ steps.task-definition.outputs.arn }}
+        run: |
+          set -euo pipefail
+
+          ACTUAL_TASK_DEFINITION=$(aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0].taskDefinition' \
+            --output text)
+
+          if [[ "$ACTUAL_TASK_DEFINITION" != "$EXPECTED_TASK_DEFINITION" ]]; then
+            echo "::error::Backend service is not using the expected task definition."
+            exit 1
+          fi
+
+          aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0].{status:status,desiredCount:desiredCount,runningCount:runningCount,taskDefinition:taskDefinition}' \
+            --output table
+
+      - name: Deployment summary
+        if: always()
+        env:
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
+          TASK_DEFINITION: ${{ steps.task-definition.outputs.arn }}
+        run: |
+          echo "Backend deployment workflow finished."
+          echo "Commit: $GITHUB_SHA"
+          echo "Image tag: ${IMAGE_TAG:-not-built}"
+          echo "Image URI: ${IMAGE_URI:-not-built}"
+          echo "Task definition: ${TASK_DEFINITION:-not-registered}"
