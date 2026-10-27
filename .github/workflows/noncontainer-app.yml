@@ -1,4 +1,4 @@
-name: Non-containerized Application Release
+name: EC2 Non-containerized Release
 on:
   workflow_dispatch:
     inputs:
