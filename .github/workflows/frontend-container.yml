@@ -1,3 +1,4 @@
+
 name: Frontend Container Deployment
 
 on:
@@ -10,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       deploy_environment:
-        description: 'Select deployment environment'
+        description: Select deployment environment
         required: true
         type: choice
         options:
@@ -52,7 +53,7 @@ jobs:
           echo "Selected environment: $SELECTED_ENVIRONMENT"
 
           if [[ "$DEPLOY_ENV" != "$SELECTED_ENVIRONMENT" ]]; then
-            echo "::error::DEPLOY_ENV '$DEPLOY_ENV' does not match selected environment '$SELECTED_ENVIRONMENT'."
+            echo "::error::DEPLOY_ENV does not match the selected environment."
             exit 1
           fi
 
@@ -89,9 +90,14 @@ jobs:
             exit 1
           fi
 
+          if [[ "$AWS_REGION" != "us-east-1" ]]; then
+            echo "::error::Unexpected AWS region: $AWS_REGION"
+            exit 1
+          fi
+
           echo "AWS region: $AWS_REGION"
           echo "ECS cluster: $ECS_CLUSTER"
-          echo "ECS frontend service: $ECS_FRONTEND_SERVICE"
+          echo "Frontend service: $ECS_FRONTEND_SERVICE"
           echo "ECR repository: $ECR_FRONTEND_REPOSITORY"
 
       - name: Set up Node.js
@@ -154,6 +160,8 @@ jobs:
 
           echo "uri=$IMAGE" >> "$GITHUB_OUTPUT"
           echo "tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+          echo "Pushed image: $IMAGE"
 
       - name: Validate frontend ECS service
         env:
@@ -256,7 +264,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Deploying to cluster: $CLUSTER"
+          echo "Deploying cluster: $CLUSTER"
           echo "Deploying service: $SERVICE"
           echo "Task definition: $TASK_DEFINITION"
 
@@ -309,12 +317,12 @@ jobs:
       - name: Deployment summary
         if: always()
         env:
-          IMAGE_TAG: ${{ steps.image.outputs.tag }}
-          IMAGE_URI: ${{ steps.image.outputs.uri }}
-          TASK_DEFINITION: ${{ steps.task-definition.outputs.arn }}
           SELECTED_ENVIRONMENT: ${{ inputs.deploy_environment || 'dev' }}
           ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
           ECS_FRONTEND_SERVICE: ${{ vars.ECS_FRONTEND_SERVICE }}
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
+          TASK_DEFINITION: ${{ steps.task-definition.outputs.arn }}
         run: |
           echo "Frontend deployment workflow finished."
           echo "Environment: $SELECTED_ENVIRONMENT"
