@@ -1,4 +1,3 @@
-
 name: Frontend Container Deployment
 
 on:
@@ -7,28 +6,41 @@ on:
     paths:
       - 'apps/frontend/**'
       - '.github/workflows/frontend-container.yml'
+
   workflow_dispatch:
+    inputs:
+      deploy_environment:
+        description: 'Select deployment environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+        default: dev
 
 permissions:
   contents: read
   id-token: write
 
 concurrency:
-  group: frontend-deploy-${{ vars.DEPLOY_ENV || 'dev' }}
+  group: frontend-deploy-${{ inputs.deploy_environment || 'dev' }}
   cancel-in-progress: false
 
 jobs:
   build-test-deploy:
     name: Build and Deploy Frontend
     runs-on: ubuntu-latest
-    environment: ${{ vars.DEPLOY_ENV || 'dev' }}
+    environment: ${{ inputs.deploy_environment || 'dev' }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Validate deployment variables
+      - name: Validate deployment configuration
         env:
+          SELECTED_ENVIRONMENT: ${{ inputs.deploy_environment || 'dev' }}
+          DEPLOY_ENV: ${{ vars.DEPLOY_ENV }}
           AWS_REGION: ${{ vars.AWS_REGION }}
           AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
           ECR_FRONTEND_REPOSITORY: ${{ vars.ECR_FRONTEND_REPOSITORY }}
@@ -36,12 +48,51 @@ jobs:
           ECS_FRONTEND_SERVICE: ${{ vars.ECS_FRONTEND_SERVICE }}
         run: |
           set -euo pipefail
+
+          echo "Selected environment: $SELECTED_ENVIRONMENT"
+
+          if [[ "$DEPLOY_ENV" != "$SELECTED_ENVIRONMENT" ]]; then
+            echo "::error::DEPLOY_ENV '$DEPLOY_ENV' does not match selected environment '$SELECTED_ENVIRONMENT'."
+            exit 1
+          fi
+
           for name in AWS_REGION AWS_ROLE_ARN ECR_FRONTEND_REPOSITORY ECS_CLUSTER ECS_FRONTEND_SERVICE; do
             if [[ -z "${!name:-}" ]]; then
               echo "::error::Required GitHub variable '$name' is missing."
               exit 1
             fi
           done
+
+          case "$SELECTED_ENVIRONMENT" in
+            dev)
+              EXPECTED_CLUSTER="dev-app-cluster"
+              EXPECTED_SERVICE="dev-frontend"
+              ;;
+            staging)
+              EXPECTED_CLUSTER="staging-app-cluster"
+              EXPECTED_SERVICE="staging-frontend"
+              ;;
+            prod)
+              EXPECTED_CLUSTER="prod-app-cluster"
+              EXPECTED_SERVICE="prod-frontend"
+              ;;
+            *)
+              echo "::error::Unsupported deployment environment."
+              exit 1
+              ;;
+          esac
+
+          if [[ "$ECS_CLUSTER" != "$EXPECTED_CLUSTER" || "$ECS_FRONTEND_SERVICE" != "$EXPECTED_SERVICE" ]]; then
+            echo "::error::ECS configuration does not match the selected environment."
+            echo "Expected cluster: $EXPECTED_CLUSTER"
+            echo "Expected service: $EXPECTED_SERVICE"
+            exit 1
+          fi
+
+          echo "AWS region: $AWS_REGION"
+          echo "ECS cluster: $ECS_CLUSTER"
+          echo "ECS frontend service: $ECS_FRONTEND_SERVICE"
+          echo "ECR repository: $ECR_FRONTEND_REPOSITORY"
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -65,8 +116,23 @@ jobs:
           role-session-name: GitHubActionsFrontendDeploy
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Verify AWS identity
-        run: aws sts get-caller-identity
+      - name: Verify AWS identity and account
+        env:
+          SELECTED_ENVIRONMENT: ${{ inputs.deploy_environment || 'dev' }}
+        run: |
+          set -euo pipefail
+
+          IDENTITY=$(aws sts get-caller-identity)
+          echo "$IDENTITY"
+
+          ACCOUNT_ID=$(echo "$IDENTITY" | jq -r '.Account')
+
+          if [[ "$ACCOUNT_ID" != "419423654302" ]]; then
+            echo "::error::Unexpected AWS account: $ACCOUNT_ID"
+            exit 1
+          fi
+
+          echo "AWS account verified for $SELECTED_ENVIRONMENT."
 
       - name: Log in to Amazon ECR
         id: login-ecr
@@ -80,6 +146,7 @@ jobs:
           IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
+
           IMAGE="$REGISTRY/$REPOSITORY:$IMAGE_TAG"
 
           docker build --tag "$IMAGE" apps/frontend
@@ -92,12 +159,14 @@ jobs:
         env:
           CLUSTER: ${{ vars.ECS_CLUSTER }}
           SERVICE: ${{ vars.ECS_FRONTEND_SERVICE }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
         run: |
           set -euo pipefail
 
           aws ecs describe-services \
             --cluster "$CLUSTER" \
             --services "$SERVICE" \
+            --region "$AWS_REGION" \
             --query 'services[0]' \
             --output json > service.json
 
@@ -112,6 +181,7 @@ jobs:
 
           aws ecs describe-task-definition \
             --task-definition "$CURRENT_TASK_DEFINITION" \
+            --region "$AWS_REGION" \
             --query taskDefinition \
             > task-definition.json
 
@@ -121,23 +191,28 @@ jobs:
               exit 1
             }
 
+          echo "Current task definition: $CURRENT_TASK_DEFINITION"
+
       - name: Register updated task definition
         id: task-definition
         env:
           CLUSTER: ${{ vars.ECS_CLUSTER }}
           SERVICE: ${{ vars.ECS_FRONTEND_SERVICE }}
           IMAGE: ${{ steps.image.outputs.uri }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
         run: |
           set -euo pipefail
 
           CURRENT_TASK_DEFINITION=$(aws ecs describe-services \
             --cluster "$CLUSTER" \
             --services "$SERVICE" \
+            --region "$AWS_REGION" \
             --query 'services[0].taskDefinition' \
             --output text)
 
           aws ecs describe-task-definition \
             --task-definition "$CURRENT_TASK_DEFINITION" \
+            --region "$AWS_REGION" \
             --query taskDefinition \
             > task-definition.json
 
@@ -165,52 +240,71 @@ jobs:
 
           ARN=$(aws ecs register-task-definition \
             --cli-input-json file://task-definition-new.json \
+            --region "$AWS_REGION" \
             --query 'taskDefinition.taskDefinitionArn' \
             --output text)
 
           echo "arn=$ARN" >> "$GITHUB_OUTPUT"
+          echo "Registered task definition: $ARN"
 
       - name: Deploy frontend ECS service
         env:
           CLUSTER: ${{ vars.ECS_CLUSTER }}
           SERVICE: ${{ vars.ECS_FRONTEND_SERVICE }}
           TASK_DEFINITION: ${{ steps.task-definition.outputs.arn }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
         run: |
           set -euo pipefail
+
+          echo "Deploying to cluster: $CLUSTER"
+          echo "Deploying service: $SERVICE"
+          echo "Task definition: $TASK_DEFINITION"
 
           aws ecs update-service \
             --cluster "$CLUSTER" \
             --service "$SERVICE" \
-            --task-definition "$TASK_DEFINITION"
+            --task-definition "$TASK_DEFINITION" \
+            --region "$AWS_REGION"
 
           aws ecs wait services-stable \
             --cluster "$CLUSTER" \
-            --services "$SERVICE"
+            --services "$SERVICE" \
+            --region "$AWS_REGION"
 
       - name: Verify deployed frontend
         env:
           CLUSTER: ${{ vars.ECS_CLUSTER }}
           SERVICE: ${{ vars.ECS_FRONTEND_SERVICE }}
           EXPECTED_TASK_DEFINITION: ${{ steps.task-definition.outputs.arn }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
         run: |
           set -euo pipefail
 
-          ACTUAL_TASK_DEFINITION=$(aws ecs describe-services \
+          aws ecs describe-services \
             --cluster "$CLUSTER" \
             --services "$SERVICE" \
-            --query 'services[0].taskDefinition' \
-            --output text)
+            --region "$AWS_REGION" \
+            --query 'services[0].{status:status,desiredCount:desiredCount,runningCount:runningCount,taskDefinition:taskDefinition}' \
+            --output json > deployed-service.json
+
+          ACTUAL_TASK_DEFINITION=$(jq -r '.taskDefinition' deployed-service.json)
+          STATUS=$(jq -r '.status' deployed-service.json)
+          DESIRED=$(jq -r '.desiredCount' deployed-service.json)
+          RUNNING=$(jq -r '.runningCount' deployed-service.json)
+
+          cat deployed-service.json
 
           if [[ "$ACTUAL_TASK_DEFINITION" != "$EXPECTED_TASK_DEFINITION" ]]; then
             echo "::error::Frontend service is not using the expected task definition."
             exit 1
           fi
 
-          aws ecs describe-services \
-            --cluster "$CLUSTER" \
-            --services "$SERVICE" \
-            --query 'services[0].{status:status,desiredCount:desiredCount,runningCount:runningCount,taskDefinition:taskDefinition}' \
-            --output table
+          if [[ "$STATUS" != "ACTIVE" || "$RUNNING" != "$DESIRED" ]]; then
+            echo "::error::Frontend ECS service is not healthy."
+            exit 1
+          fi
+
+          echo "Frontend deployment verified successfully."
 
       - name: Deployment summary
         if: always()
@@ -218,8 +312,14 @@ jobs:
           IMAGE_TAG: ${{ steps.image.outputs.tag }}
           IMAGE_URI: ${{ steps.image.outputs.uri }}
           TASK_DEFINITION: ${{ steps.task-definition.outputs.arn }}
+          SELECTED_ENVIRONMENT: ${{ inputs.deploy_environment || 'dev' }}
+          ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+          ECS_FRONTEND_SERVICE: ${{ vars.ECS_FRONTEND_SERVICE }}
         run: |
           echo "Frontend deployment workflow finished."
+          echo "Environment: $SELECTED_ENVIRONMENT"
+          echo "Cluster: ${ECS_CLUSTER:-not-set}"
+          echo "Service: ${ECS_FRONTEND_SERVICE:-not-set}"
           echo "Commit: $GITHUB_SHA"
           echo "Image tag: ${IMAGE_TAG:-not-built}"
           echo "Image URI: ${IMAGE_URI:-not-built}"
