@@ -7,11 +7,10 @@ on:
     paths:
       - 'apps/backend/**'
       - '.github/workflows/backend-container.yml'
-
   workflow_dispatch:
     inputs:
       deploy_environment:
-        description: 'Select deployment environment'
+        description: Select deployment environment
         required: true
         type: choice
         options:
@@ -38,6 +37,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # --------------------------------------------------
+      # Validate selected environment and deployment config
+      # --------------------------------------------------
       - name: Validate deployment configuration
         env:
           SELECTED_ENVIRONMENT: ${{ inputs.deploy_environment || 'dev' }}
@@ -64,7 +66,6 @@ jobs:
             fi
           done
 
-          # Protect against accidentally deploying to the wrong ECS service.
           case "$SELECTED_ENVIRONMENT" in
             dev)
               EXPECTED_CLUSTER="dev-app-cluster"
@@ -91,11 +92,19 @@ jobs:
             exit 1
           fi
 
-          echo "Region: $AWS_REGION"
-          echo "Cluster: $ECS_CLUSTER"
-          echo "Service: $ECS_BACKEND_SERVICE"
+          if [[ "$AWS_REGION" != "us-east-1" ]]; then
+            echo "::error::Unexpected AWS region: $AWS_REGION"
+            exit 1
+          fi
+
+          echo "AWS region: $AWS_REGION"
+          echo "ECS cluster: $ECS_CLUSTER"
+          echo "Backend service: $ECS_BACKEND_SERVICE"
           echo "ECR repository: $ECR_BACKEND_REPOSITORY"
 
+      # --------------------------------------------------
+      # Python setup and tests
+      # --------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -107,7 +116,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install -r apps/backend/requirements.txt pytest
+          python -m pip install -r apps/backend/requirements.txt pytest httpx
 
       - name: Compile backend
         run: python -m compileall apps/backend
@@ -129,9 +138,13 @@ jobs:
           assert response.status_code == 200, (
               f"Health check failed: {response.status_code} {response.text}"
           )
+
           print("Backend health endpoint test passed.")
           PY
 
+      # --------------------------------------------------
+      # AWS OIDC authentication
+      # --------------------------------------------------
       - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -141,7 +154,6 @@ jobs:
 
       - name: Verify AWS identity and account
         env:
-          AWS_REGION: ${{ vars.AWS_REGION }}
           SELECTED_ENVIRONMENT: ${{ inputs.deploy_environment || 'dev' }}
         run: |
           set -euo pipefail
@@ -156,8 +168,11 @@ jobs:
             exit 1
           fi
 
-          echo "AWS account verified."
+          echo "AWS account verified for $SELECTED_ENVIRONMENT."
 
+      # --------------------------------------------------
+      # ECR login and image build
+      # --------------------------------------------------
       - name: Log in to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
@@ -179,6 +194,11 @@ jobs:
           echo "uri=$IMAGE" >> "$GITHUB_OUTPUT"
           echo "tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
+          echo "Pushed image: $IMAGE"
+
+      # --------------------------------------------------
+      # Validate existing ECS service and task definition
+      # --------------------------------------------------
       - name: Validate backend ECS service
         env:
           CLUSTER: ${{ vars.ECS_CLUSTER }}
@@ -217,6 +237,9 @@ jobs:
 
           echo "Current task definition: $CURRENT_TASK_DEFINITION"
 
+      # --------------------------------------------------
+      # Register updated task definition
+      # --------------------------------------------------
       - name: Register updated task definition
         id: task-definition
         env:
@@ -271,6 +294,9 @@ jobs:
           echo "arn=$ARN" >> "$GITHUB_OUTPUT"
           echo "Registered task definition: $ARN"
 
+      # --------------------------------------------------
+      # Deploy and wait for ECS stability
+      # --------------------------------------------------
       - name: Deploy backend ECS service
         env:
           CLUSTER: ${{ vars.ECS_CLUSTER }}
@@ -280,7 +306,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Deploying to cluster: $CLUSTER"
+          echo "Deploying cluster: $CLUSTER"
           echo "Deploying service: $SERVICE"
           echo "Task definition: $TASK_DEFINITION"
 
@@ -295,6 +321,9 @@ jobs:
             --services "$SERVICE" \
             --region "$AWS_REGION"
 
+      # --------------------------------------------------
+      # Verify deployment
+      # --------------------------------------------------
       - name: Verify deployed backend
         env:
           CLUSTER: ${{ vars.ECS_CLUSTER }}
@@ -330,15 +359,18 @@ jobs:
 
           echo "Backend deployment verified successfully."
 
+      # --------------------------------------------------
+      # Summary, including on failure
+      # --------------------------------------------------
       - name: Deployment summary
         if: always()
         env:
-          IMAGE_TAG: ${{ steps.image.outputs.tag }}
-          IMAGE_URI: ${{ steps.image.outputs.uri }}
-          TASK_DEFINITION: ${{ steps.task-definition.outputs.arn }}
           SELECTED_ENVIRONMENT: ${{ inputs.deploy_environment || 'dev' }}
           ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
           ECS_BACKEND_SERVICE: ${{ vars.ECS_BACKEND_SERVICE }}
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
+          TASK_DEFINITION: ${{ steps.task-definition.outputs.arn }}
         run: |
           echo "Backend deployment workflow finished."
           echo "Environment: $SELECTED_ENVIRONMENT"
