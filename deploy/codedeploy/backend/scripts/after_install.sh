@@ -1,7 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 cd /opt/coditude/backend/current
-python3.12 -m venv /opt/coditude/backend/venv
+PYTHON_BIN="$(command -v python3.12 || command -v python3 || command -v python)"
+if [ -z "$PYTHON_BIN" ]; then
+  echo "Python is not installed or not available in PATH"
+  exit 1
+fi
+"$PYTHON_BIN" -m venv /opt/coditude/backend/venv
 /opt/coditude/backend/venv/bin/pip install --upgrade pip
 /opt/coditude/backend/venv/bin/pip install -r requirements.txt
 cat >/etc/systemd/system/coditude-backend.service <<'UNIT'
